@@ -1,15 +1,15 @@
-"""Store agent responses, child conversations, and resumable checkpoints.
+"""Add execution metadata and child-session links.
 
-Revision ID: 7a03b6e90c12
-Revises: a27d64f7b810
+Revision ID: 9d8f310ac672
+Revises: 6b4e821c0a93
 """
 
 from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
-revision = "7a03b6e90c12"
-down_revision = "a27d64f7b810"
+revision = "9d8f310ac672"
+down_revision = "6b4e821c0a93"
 branch_labels = None
 depends_on = None
 
@@ -28,9 +28,12 @@ def _index_state(conn: sa.engine.Connection, qualified_name: str) -> bool | None
 def upgrade() -> None:
     bind = op.get_bind()
     schema: str = bind.execute(sa.text("SELECT current_schema()")).scalar_one()
-    # The schema phase commits together; its final table identifies a retry.
-    if not sa.inspect(bind).has_table("chat_response_checkpoint", schema=schema):
-        _add_response_storage()
+    # The metadata phase commits together; its final column identifies a retry.
+    if "run_id" not in {
+        column["name"]
+        for column in sa.inspect(bind).get_columns("chat_message", schema=schema)
+    }:
+        _add_execution_metadata()
     # Release DDL locks and our snapshot before concurrent index construction.
     # env.py owns the transaction, so Alembic's autocommit_block cannot be used.
     bind.commit()
@@ -81,7 +84,7 @@ def upgrade() -> None:
             )
 
 
-def _add_response_storage() -> None:
+def _add_execution_metadata() -> None:
     op.alter_column("tool_call", "tool_id", existing_type=sa.Integer(), nullable=True)
     op.add_column(
         "chat_session", sa.Column("spawned_by_message_id", sa.Integer(), nullable=True)
@@ -120,71 +123,10 @@ def _add_response_storage() -> None:
         sa.Column("result", postgresql.JSONB(), nullable=True),
     ):
         op.add_column("tool_call", column)
-    op.create_table(
-        "chat_response_item",
-        sa.Column("id", sa.String(), primary_key=True),
-        sa.Column(
-            "chat_message_id",
-            sa.Integer(),
-            sa.ForeignKey("chat_message.id", ondelete="CASCADE"),
-            nullable=False,
-        ),
-        sa.Column("step_index", sa.Integer(), nullable=False),
-        sa.Column("generation_status", sa.String(), nullable=True),
-        sa.Column("is_answer", sa.Boolean(), nullable=False, server_default=sa.false()),
-        sa.Column("message", postgresql.JSONB(), nullable=True),
-        sa.Column(
-            "tool_call_id",
-            sa.Integer(),
-            sa.ForeignKey("tool_call.id", ondelete="CASCADE"),
-            nullable=True,
-        ),
-        sa.Column("rendering", postgresql.JSONB(), nullable=True),
-        sa.UniqueConstraint("tool_call_id", name="uq_response_item_tool"),
-        sa.CheckConstraint("step_index >= 0", name="ck_response_item_step_index"),
-        sa.CheckConstraint(
-            "(message IS NOT NULL AND tool_call_id IS NULL AND generation_status IS NOT NULL) OR (message IS NULL AND tool_call_id IS NOT NULL AND generation_status IS NULL AND NOT is_answer)",
-            name="ck_response_item_kind",
-        ),
-    )
-    op.create_index(
-        "ix_response_item_step",
-        "chat_response_item",
-        ["chat_message_id", "step_index"],
-    )
-    op.create_index(
-        "uq_response_item_step",
-        "chat_response_item",
-        ["chat_message_id", "step_index"],
-        unique=True,
-        postgresql_where=sa.text("message IS NOT NULL"),
-    )
-    op.create_index(
-        "uq_response_item_answer",
-        "chat_response_item",
-        ["chat_message_id"],
-        unique=True,
-        postgresql_where=sa.text("is_answer"),
-    )
-
     op.add_column("chat_message", sa.Column("run_id", sa.String(), nullable=True))
-    op.create_table(
-        "chat_response_checkpoint",
-        sa.Column(
-            "chat_message_id",
-            sa.Integer(),
-            sa.ForeignKey("chat_message.id", ondelete="CASCADE"),
-            primary_key=True,
-        ),
-        sa.Column(
-            "ownership_version", sa.BigInteger(), server_default="0", nullable=False
-        ),
-        sa.Column("state", postgresql.JSONB(), nullable=False),
-    )
 
 
 def downgrade() -> None:
-    op.drop_table("chat_response_checkpoint")
     op.drop_constraint("uq_chat_message_run_id", "chat_message", type_="unique")
     op.drop_column("chat_message", "run_id")
 
@@ -193,7 +135,6 @@ def downgrade() -> None:
         UPDATE tool_call SET tool_call_response = result->>'content'
         WHERE result IS NOT NULL AND result <> 'null'::jsonb
     """)
-    op.drop_table("chat_response_item")
     op.execute("DELETE FROM chat_session WHERE spawned_by_message_id IS NOT NULL")
     op.execute("DELETE FROM tool_call WHERE tool_id IS NULL")
     op.alter_column("tool_call", "tool_id", existing_type=sa.Integer(), nullable=False)
