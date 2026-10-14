@@ -90,6 +90,22 @@ data being gone.
 
 ## 3. Data model
 
+`chat_response_item.message` stores one complete or partial model message; alternative rows reference tool results.
+`generation_status` records the model generation outcome, independently of the whole response or tool outcome.
+`is_answer` identifies the step the runtime accepted as its answer. Partial output need not be an accepted answer.
+Response items use `step_index` for generation order and the assistant’s tool-call list for result order.
+The nonunique `(chat_message_id, step_index)` index supports response lookups.
+A separate partial unique index permits one assistant message per step.
+
+Tool names and argument parsing details stay in the saved model message. Tool rows retain queryable arguments and execution results.
+Application enums define response, generation, and tool statuses; historical response and tool rows can have null statuses.
+
+`chat_response_checkpoint` stores resume progress alongside response history, rather than another copy of that history.
+Its `ownership_version` changes when a checkpoint is published or claimed, preventing stale owners from saving.
+The runtime revision inside `state` tracks execution changes and serves a separate purpose.
+Checkpoint bindings identify the tenant and response. Saved progress uses the runtime’s field names, including
+`pending_tool_calls` and `human_tool_answers`.
+
 ### `ChatSession` (`db/models.py:ChatSession`, table `chat_session`)
 
 | Column | Notes |

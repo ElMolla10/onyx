@@ -310,6 +310,11 @@ propagates immediately; the stream is not restarted mid-answer.
 
 ### 4.7 Tracing
 
+Cancellation listeners use the same exception handling before and after cancellation.
+`AgentCancelled` from one listener does not prevent other listeners from running.
+Active generation spans record cancellation errors. If an invoke response arrives before
+cancellation is observed, its usage remains recorded even when the answer is discarded.
+
 `LitellmLLM.invoke` and `LitellmLLM.stream` each open their own generation span with
 `tracing/llm_utils.py:llm_generation_span`. The flow tag comes from
 `GenerationContext.flow`. If the caller sets no flow, the span uses
