@@ -28,8 +28,8 @@ def _index_state(conn: sa.engine.Connection, qualified_name: str) -> bool | None
 def upgrade() -> None:
     bind = op.get_bind()
     schema: str = bind.execute(sa.text("SELECT current_schema()")).scalar_one()
-    # The metadata phase commits together; its final column identifies a retry.
-    if "run_id" not in {
+    # The metadata phase commits together; the invocation column identifies a retry.
+    if "invoking_tool_call_id" not in {
         column["name"]
         for column in sa.inspect(bind).get_columns("chat_message", schema=schema)
     }:
@@ -50,11 +50,6 @@ def upgrade() -> None:
                 'CREATE INDEX CONCURRENTLY "ix_chat_message_invoking_tool_call_id" '
                 f"ON {quoted_schema}.chat_message (invoking_tool_call_id)",
             ),
-            (
-                "uq_chat_message_run_id",
-                'CREATE UNIQUE INDEX CONCURRENTLY "uq_chat_message_run_id" '
-                f"ON {quoted_schema}.chat_message (run_id)",
-            ),
         ):
             qualified_name = f'{quoted_schema}."{name}"'
             state = _index_state(conn, qualified_name)
@@ -64,16 +59,6 @@ def upgrade() -> None:
                 conn.exec_driver_sql(f"DROP INDEX CONCURRENTLY {qualified_name}")
             conn.exec_driver_sql(statement)
 
-        if not any(
-            constraint["name"] == "uq_chat_message_run_id"
-            for constraint in sa.inspect(conn).get_unique_constraints(
-                "chat_message", schema=schema
-            )
-        ):
-            conn.exec_driver_sql(
-                f"ALTER TABLE {quoted_schema}.chat_message ADD CONSTRAINT "
-                "uq_chat_message_run_id UNIQUE USING INDEX uq_chat_message_run_id"
-            )
         # Validate only after releasing the initial ALTER TABLE locks.
         for table, constraint in (
             ("chat_session", "fk_chat_session_spawned_by_message"),
@@ -123,13 +108,9 @@ def _add_execution_metadata() -> None:
         sa.Column("result", postgresql.JSONB(), nullable=True),
     ):
         op.add_column("tool_call", column)
-    op.add_column("chat_message", sa.Column("run_id", sa.String(), nullable=True))
 
 
 def downgrade() -> None:
-    op.drop_constraint("uq_chat_message_run_id", "chat_message", type_="unique")
-    op.drop_column("chat_message", "run_id")
-
     # The public answer projections remain readable by the original schema.
     op.execute("""
         UPDATE tool_call SET tool_call_response = result->>'content'
