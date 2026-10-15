@@ -13,6 +13,9 @@ down_revision = "6b4e821c0a93"
 branch_labels = None
 depends_on = None
 
+# Match the existing concurrent-index migration; a retry repairs invalid indexes.
+LOCK_TIMEOUT = "60s"
+
 
 def _index_state(conn: sa.engine.Connection, qualified_name: str) -> bool | None:
     """An interrupted concurrent build can leave an invalid index."""
@@ -38,6 +41,7 @@ def upgrade() -> None:
     # env.py owns the transaction, so Alembic's autocommit_block cannot be used.
     bind.commit()
     with bind.engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        conn.exec_driver_sql(f"SET lock_timeout = '{LOCK_TIMEOUT}'")
         quoted_schema = conn.dialect.identifier_preparer.quote_identifier(schema)
         for name, statement in (
             (
@@ -100,7 +104,9 @@ def _add_execution_metadata() -> None:
         "tool_call",
         ["invoking_tool_call_id"],
         ["id"],
-        ondelete="CASCADE",
+        # Child-session cascades must finish before checking invocation provenance.
+        deferrable=True,
+        initially="DEFERRED",
         postgresql_not_valid=True,
     )
     for column in (
@@ -118,6 +124,7 @@ def downgrade() -> None:
     """)
     op.execute("DELETE FROM chat_session WHERE spawned_by_message_id IS NOT NULL")
     op.execute("DELETE FROM tool_call WHERE tool_id IS NULL")
+    op.execute("SET CONSTRAINTS fk_chat_message_invocation IMMEDIATE")
     op.alter_column("tool_call", "tool_id", existing_type=sa.Integer(), nullable=False)
     for column in (
         "response_status",

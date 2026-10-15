@@ -3,6 +3,7 @@
 from pathlib import Path
 from uuid import uuid4
 
+import pytest
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from alembic.script import ScriptDirectory
@@ -19,11 +20,14 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.engine import Connection
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 from sqlalchemy.schema import CreateSchema, DropSchema
 
 
-def test_response_storage_upgrade_downgrade_upgrade(db_session: Session) -> None:
+def test_response_storage_upgrade_downgrade_upgrade(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
     schema = f"response_migration_{uuid4().hex}"
     with db_session.connection().engine.connect() as connection:
         try:
@@ -234,17 +238,36 @@ def test_response_storage_upgrade_downgrade_upgrade(db_session: Session) -> None
                         "chat_message", schema=schema
                     )
                 }
-                # Retry after metadata commits but before all indexes exist.
+                # An older writer blocks concurrent construction and leaves an invalid index.
                 connection.execute(
-                    text("DROP INDEX ix_chat_message_invoking_tool_call_id")
+                    text("DROP INDEX ix_chat_session_spawned_by_message_id")
                 )
                 connection.commit()
+                monkeypatch.setattr(revision.module, "LOCK_TIMEOUT", "100ms")
+                with connection.engine.connect() as blocker:
+                    blocker.execute(
+                        text(
+                            f'LOCK TABLE "{schema}".chat_session IN ROW EXCLUSIVE MODE'
+                        )
+                    )
+                    with pytest.raises(OperationalError, match="lock timeout"):
+                        revision.module.upgrade()
+                    blocker.rollback()
+                assert (
+                    connection.scalar(
+                        text("""
+                    SELECT indisvalid FROM pg_index
+                    WHERE indexrelid='ix_chat_session_spawned_by_message_id'::regclass
+                """)
+                    )
+                    is False
+                )
                 revision.module.upgrade()
                 assert (
                     connection.scalar(
                         text("""
                     SELECT indisvalid FROM pg_index
-                    WHERE indexrelid='ix_chat_message_invoking_tool_call_id'::regclass
+                    WHERE indexrelid='ix_chat_session_spawned_by_message_id'::regclass
                 """)
                     )
                     is True
@@ -294,6 +317,81 @@ def test_response_storage_upgrade_downgrade_upgrade(db_session: Session) -> None
                 """),
                     {"root": root_id, "child": child_id, "grandchild": grandchild_id},
                 )
+                # Invocation records provenance; only the owning message deletes a child session.
+                assert (
+                    connection.scalar(
+                        text("""
+                    SELECT confdeltype FROM pg_constraint
+                    WHERE conrelid='chat_message'::regclass
+                    AND conname='fk_chat_message_invocation'
+                """)
+                    )
+                    == "a"
+                )
+                connection.execute(
+                    text("""
+                    INSERT INTO tool_call (id, chat_session_id, parent_chat_message_id, tool_id, tool_call_response)
+                    VALUES (12, :root, 42, 1, 'Pending child');
+                    INSERT INTO chat_message (id, chat_session_id, message, message_type, invoking_tool_call_id)
+                    VALUES (105, :child, 'Unanswered child input', 'USER', 12);
+                """),
+                    {"root": root_id, "child": child_id},
+                )
+                for call_id in (7, 12):
+                    with pytest.raises(
+                        IntegrityError, match="fk_chat_message_invocation"
+                    ):
+                        with connection.begin_nested():
+                            connection.execute(
+                                text("DELETE FROM tool_call WHERE id=:id"),
+                                {"id": call_id},
+                            )
+                            connection.execute(
+                                text(
+                                    "SET CONSTRAINTS fk_chat_message_invocation IMMEDIATE"
+                                )
+                            )
+                    assert (
+                        connection.scalar(
+                            text(
+                                "SELECT count(*) FROM chat_message WHERE id IN (101, 102, 105)"
+                            )
+                        )
+                        == 3
+                    )
+                connection.execute(text("DELETE FROM chat_message WHERE id=105"))
+                connection.execute(text("DELETE FROM tool_call WHERE id=12"))
+                with connection.begin_nested() as deletion:
+                    connection.execute(
+                        text("DELETE FROM chat_session WHERE id=:root"),
+                        {"root": root_id},
+                    )
+                    connection.execute(
+                        text("SET CONSTRAINTS fk_chat_message_invocation IMMEDIATE")
+                    )
+                    for table in ("chat_session", "chat_message", "tool_call"):
+                        assert (
+                            connection.scalar(text(f"SELECT count(*) FROM {table}"))
+                            == 0
+                        )
+                    deletion.rollback()
+                with connection.begin_nested() as deletion:
+                    # Remove the separate summary that references the owning answer.
+                    connection.execute(
+                        text("DELETE FROM chat_message WHERE id IN (43, 44, 45)")
+                    )
+                    connection.execute(text("DELETE FROM chat_message WHERE id=42"))
+                    connection.execute(
+                        text("SET CONSTRAINTS fk_chat_message_invocation IMMEDIATE")
+                    )
+                    assert (
+                        connection.scalar(text("SELECT count(*) FROM chat_message"))
+                        == 0
+                    )
+                    assert connection.execute(
+                        text("SELECT id FROM chat_session")
+                    ).scalars().all() == [root_id]
+                    deletion.rollback()
                 revision.module.downgrade()
                 checkpoint_revision.module.downgrade()
                 items_revision.module.downgrade()
