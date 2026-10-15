@@ -326,6 +326,7 @@ class DocumentSource(str, Enum):
     TESTRAIL = "testrail"
     BRAINTRUST = "braintrust"
     LUMAPPS = "lumapps"
+    YOUTRACK = "youtrack"
 
     # Special case just for integration tests
     MOCK_CONNECTOR = "mock_connector"
@@ -848,4 +849,5 @@ DocumentSourceDescription: dict[DocumentSource, str] = {
     DocumentSource.TESTRAIL: "Test cases and QA management",
     DocumentSource.BRAINTRUST: "LLM eval experiments, datasets, and prompts",
     DocumentSource.LUMAPPS: "Intranet pages, news, and content",
+    DocumentSource.YOUTRACK: "Issues and project tracking",
 }
